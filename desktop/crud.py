@@ -217,3 +217,16 @@ def search_items(client: ApiClient, query: str, boxes: BoxIndex) -> List[Item]:
 
 def _item_type_name(item: Item) -> str:
     return item.item_type.item_type_name if item.item_type else ""
+
+
+def get_scale_state(client: ApiClient) -> Optional[dict]:
+    """Последнее показание весового модуля (GET /scale).
+
+    Возвращает None, если весы недоступны. Поле `stale` в ответе
+    означает, что показание старше 5 секунд.
+    """
+    try:
+        state = client.get("/scale")
+    except ApiError:
+        return None
+    return state if isinstance(state, dict) else None

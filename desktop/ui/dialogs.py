@@ -1,4 +1,6 @@
 """Модальные диалоги для CRUD операций на customtkinter."""
+import tkinter
+
 import customtkinter as ctk
 from tkinter import messagebox
 from typing import Optional
@@ -136,17 +138,31 @@ class BoxDialog:
 
 class ItemTypeDialog:
     """Диалог создания/редактирования типа товара."""
-    def __init__(self, parent, client: ApiClient, mode: str, item_type: Optional[ItemType] = None):
+
+    #: Интервал автообновления веса с весового модуля (мс).
+    WEIGHT_REFRESH_MS = 1500
+
+    def __init__(self, parent, client: ApiClient, mode: str,
+                 item_type: Optional[ItemType] = None):
         self.client = client
         self.mode = mode
         self.item_type = item_type
         self.result = False
 
+        # Вес при создании заполняется автоматически с весового
+        # модуля; флаги не дают таймеру перезаписать ручной ввод.
+        self._weight_manual = False    # пользователь правил поле вручную
+        self._updating_weight = False  # идёт программная запись поля
+        self._after_id = None
+        self._closed = False
+
         self.dialog = ctk.CTkToplevel(parent)
         self.dialog.title('Новый тип товара' if mode == 'add' else 'Редактировать тип товара')
-        self.dialog.geometry('400x180')
+        self.dialog.geometry('400x200')
         self.dialog.transient(parent)
         self.dialog.grab_set()
+        # Страховка: закрытие крестиком тоже должно остановить таймер.
+        self.dialog.bind('<Destroy>', lambda _event: setattr(self, '_closed', True))
 
         self._create_widgets()
         self.dialog.wait_window()
@@ -164,19 +180,96 @@ class ItemTypeDialog:
         name_entry.grid(row=0, column=1, pady=5)
         name_entry.focus()
 
-        # Вес
+        # Вес: при создании типа заполняется автоматически с
+        # весового модуля (эмулятор из firmware/weight_module)
         ctk.CTkLabel(frame, text='Вес (г):').grid(row=1, column=0, sticky='w', pady=5)
         self.weight_var = ctk.StringVar()
+        self.weight_var.trace_add('write', self._on_weight_changed)
         if self.mode == 'edit' and self.item_type and self.item_type.weight_g is not None:
-            self.weight_var.set(str(self.item_type.weight_g))
-        weight_entry = ctk.CTkEntry(frame, textvariable=self.weight_var, width=250)
-        weight_entry.grid(row=1, column=1, pady=5)
+            self._set_weight_field(self.item_type.weight_g)
+        weight_cell = ctk.CTkFrame(frame, fg_color='transparent')
+        weight_cell.grid(row=1, column=1, pady=5, sticky='w')
+        weight_entry = ctk.CTkEntry(weight_cell, textvariable=self.weight_var, width=160)
+        weight_entry.pack(side='left')
+        ctk.CTkButton(weight_cell, text='С весов', width=80,
+                      command=self._on_fetch_weight).pack(side='left', padx=(5, 0))
+
+        # Автозаполнение веса с весового модуля — только при создании
+        if self.mode == 'add':
+            self._schedule_weight_refresh()
 
         # Кнопки
         btn_frame = ctk.CTkFrame(frame, fg_color='transparent')
         btn_frame.grid(row=2, column=0, columnspan=2, pady=15)
         ctk.CTkButton(btn_frame, text='Сохранить', command=self._save, width=100).pack(side='left', padx=5)
-        ctk.CTkButton(btn_frame, text='Отмена', command=self.dialog.destroy, width=100).pack(side='left', padx=5)
+        ctk.CTkButton(btn_frame, text='Отмена', command=self._destroy_dialog, width=100).pack(side='left', padx=5)
+
+    # ------------------------------------------------------------- весы
+    def _scale_weight_g(self) -> Optional[int]:
+        """Свежее показание весов в граммах; None, если весы недоступны."""
+        state = crud.get_scale_state(self.client)
+        if not state or state.get('stale'):
+            return None
+        weight = state.get('weight_g')
+        if weight is None:
+            return None
+        return int(round(float(weight)))
+
+    def _fill_weight_from_scale(self):
+        """Заполняет поле веса текущим показанием весового модуля."""
+        weight = self._scale_weight_g()
+        # 0 — весы пусты: автоматически такое значение не ставим,
+        # ввести его вручную (или кнопкой) всё равно можно.
+        if weight:
+            self._set_weight_field(weight)
+
+    def _schedule_weight_refresh(self):
+        """Перечитывает показание весов, пока диалог открыт и поле
+        веса не редактировалось вручную: эмулятор выставляет груз,
+        значение стабилизируется — и только тогда его стоит сохранять."""
+        if self._closed or self._weight_manual:
+            return
+        self._fill_weight_from_scale()
+        if self._closed or self._weight_manual:
+            return
+        try:
+            self._after_id = self.dialog.after(
+                self.WEIGHT_REFRESH_MS, self._schedule_weight_refresh)
+        except tkinter.TclError:
+            # Диалог уже закрыт — дальше перечитывать нечего
+            self._closed = True
+
+    def _on_fetch_weight(self):
+        """Кнопка «С весов»: показать текущее показание, даже если
+        оно нулевое, и прекратить автообновление."""
+        weight = self._scale_weight_g()
+        if weight is None:
+            messagebox.showinfo('Весы', 'Нет свежего показания весов')
+            return
+        self._set_weight_field(weight)
+        self._weight_manual = True
+
+    def _set_weight_field(self, weight_g: Optional[int]):
+        self._updating_weight = True
+        try:
+            self.weight_var.set('' if weight_g is None else str(weight_g))
+        finally:
+            self._updating_weight = False
+
+    def _on_weight_changed(self, *_args):
+        if self._updating_weight:
+            return
+        self._weight_manual = True
+
+    def _destroy_dialog(self):
+        self._closed = True
+        if self._after_id is not None:
+            try:
+                self.dialog.after_cancel(self._after_id)
+            except tkinter.TclError:
+                pass
+            self._after_id = None
+        self.dialog.destroy()
 
     def _save(self):
         name = self.name_var.get().strip()
@@ -185,7 +278,11 @@ class ItemTypeDialog:
             return
 
         weight_str = self.weight_var.get().strip()
-        weight_g = int(weight_str) if weight_str else None
+        try:
+            weight_g = int(round(float(weight_str))) if weight_str else None
+        except ValueError:
+            messagebox.showerror('Ошибка', f'Неверный вес: {weight_str}')
+            return
 
         try:
             if self.mode == 'add':
@@ -193,7 +290,7 @@ class ItemTypeDialog:
             else:
                 crud.update_item_type(self.client, self.item_type.item_type_id, name, weight_g)
             self.result = True
-            self.dialog.destroy()
+            self._destroy_dialog()
         except Exception as e:
             messagebox.showerror('Ошибка', str(e))
 
