@@ -60,216 +60,46 @@ class AutoScrollbar(ttk.Scrollbar):
 class ColumnSeparatorPlugin:
     """Вертикальные линии-разделители между столбцами Treeview.
 
-    Раньше разделители рисовались окном-оверлеем (tk.Canvas) поверх дерева,
-    и на Windows это полностью перекрывало содержимое таблицы — видны
-    оставались только сами линии. Теперь оверлея нет вообще: плагин
-    подмешивает тонкие 1px линии в элемент ``::text`` собственного canvas
-    Treeview (внутренний widget ttk-дерева). Линии живут внутри таблицы,
-    перерисовываются вместе с ней и никогда не закрывают текст ячеек.
-    """
+    Реализация опирается на штатный механизм ttk: элемент ``::text``
+    (экземпляр ``Treeview.Cell``) рисуется для каждой ячейки, и если у
+    этого типа элементов включена однопиксельная рамка цвета границы
+    (настраивается в ``ui.theme.apply_ttk_theme``), то между столбцами
+    появляются ровные разделительные линии на всю высоту таблицы —
+    включая шапку (через ``Treeheading.cell``).
 
-    TAG = 'col_separators'
+    Никаких canvas-оверлеев поверх таблицы больше нет: раньше они
+    перекрывали содержимое (было видно только линии) и обращались к
+    несуществующему API (``element cget ::text -widget``), из-за чего
+    приложение падало с ``AttributeError``. Плагин сводится к безопасному
+    вызову перерисовки; сам он не создаёт новых окон и ничего не рисует.
+    """
 
     def __init__(self, tree: ttk.Treeview):
         self.tree = tree
-        self._pending = None
-        self._job_tree_configure = None
-        # Запрошенные ширины колонок: ttk при stretch возвращает из
-        # column(c,'width') пересчитанное значение, поэтому ведём свою
-        # карту ширин через прокси метода column().
-        self._req_widths = {}
-        self.set_tree_column_proxy()
-        tree.bind('<Configure>', self._on_tree_configure, add='+')
-        toplevel = self.tree.winfo_toplevel()
-        toplevel.bind('<<ThemeChanged>>', lambda _e=None: self.redraw(), add='+')
-        self.redraw()
-
-    @property
-    def canvas(self):
-        """Внутренний canvas Treeview (для совместимости со старым кодом)."""
-        return self._element_canvas()
-
-    def attach(self):
-        """Совместимость: перерисовать линии."""
-        self.redraw()
-
-    def place_overlay(self):
-        """Совместимость: оверлей больше не размещается — линии на дереве."""
-        pass
-
-    def _element_canvas(self):
-        """Возвращает tk.Canvas элемента ``::text`` или None."""
-        try:
-            w = self.tree.tk.call(self.tree._w, 'element', 'cget',  # noqa: SLF001
-                                  '::text', '-widget')
-            if not w:
-                return None
-            widget = self.tree.nametowidget(w)
-            return widget if isinstance(widget, tk.Canvas) else None
-        except (tk.TclError, KeyError, ValueError):
-            return None
-
-    def _on_tree_configure(self, event):
-        """Перепозиционировать оверлей и перерисовать линии после раскладки."""
-        if event.widget is not self.tree:
-            return
-        if self._job_tree_configure is not None:
-            try:
-                self.tree.after_cancel(self._job_tree_configure)
-            except Exception:
-                pass
-        self._job_tree_configure = self.tree.after_idle(self._sync_and_redraw)
-
-    def _sync_and_redraw(self):
-        self._job_tree_configure = None
-        self.redraw()
 
     def redraw(self):
-        """Отложить перерисовку линий до завершения текущих событий Tk."""
-        if self._pending is not None:
-            try:
-                self.canvas.after_cancel(self._pending)
-            except Exception:
-                pass
-        self._pending = self.canvas.after_idle(self._draw_lines)
-
-    def set_known_widths(self, widths: dict):
-        """Запомнить заданные ширины колонок (до первого перерисовывания)."""
-        for col, value in widths.items():
-            try:
-                self._req_widths[col] = int(value)
-            except (TypeError, ValueError):
-                pass
-        self.redraw()
-
-
-    def _column_px(self, col) -> int:
-        """Фактическая ширина колонки в пикселях.
-
-        При ``stretch=True`` ttk распределяет свободное место между
-        растяжимыми колонками пропорционально их заданным ширинам;
-        реальную итоговую ширину через ``tree.column(c,'width')`` получить
-        нельзя (возвращает запрошенное значение), поэтому считаем её по
-        формуле stretch от ширины области строк. Если строки не видны —
-        берём запрошенную ширину.
-        """
+        """Перерисовать дерево, чтобы ttk заново отрисовал рамки ячеек."""
         tree = self.tree
-        cols = tree['columns']
-        # Запрошенные ширины: из карты (ставится через прокси column()) либо
-        # из текущего значения колонки (до первой установки ширины).
-        requested = {c: self._req_widths.get(c) or _raw_column_width(tree, c) or 120
-                     for c in cols}
-        children = tree.get_children()
-        avail = 0
-        if children:
-            bb = tree.bbox(children[0])
-            if bb:
-                avail = bb[2]
-        total_req = sum(requested.values()) or 1
-        if avail > total_req + 2:
-            extra = avail - total_req
-            stretched = [c for c in cols if tree.column(c, 'stretch')]
-            st_total = sum(requested[c] for c in stretched) or 1
-            width = requested[col]
-            if col in stretched and extra > 0:
-                width += round(extra * requested[col] / st_total)
-            return max(1, width)
-        return max(1, requested[col])
-
-    def set_tree_column_proxy(self):
-        """Проксировать ``tree.column``, запоминая заданные ширины колонок.
-
-        При ``stretch=True`` ttk возвращает из ``column(c, 'width')`` уже
-        пересчитанное значение, а не запрошенное пользователем — без своей
-        карты ширин разделители «съезжают» после изменения ширины колонки.
-        """
-        tree = self.tree
-        if getattr(tree, '_sep_column_patched', False):
-            return
-        original = tree.column
-
-        def column_wrapper(column=None, cnf=None, **kw):
-            # Нормализуем варианты вызова: ('optname', value), ({...},), (**kw)
-            opts = dict(cnf) if isinstance(cnf, dict) else {}
-            if isinstance(cnf, str) and kw:
-                opts.update(kw)
-            elif isinstance(cnf, str):
-                # чтение опции: column(col, 'width') — пробрасываем как есть
-                return original(column, cnf)
-            opts.update(kw)
-            if 'width' in opts:
-                try:
-                    self._req_widths[column] = int(opts['width'])
-                except (TypeError, ValueError):
-                    pass
-            return original(column, opts)
-
-        tree.column = column_wrapper
         try:
-            tree._sep_column_patched = True
-        except AttributeError:
-            pass
-
-    def _draw_lines(self):
-        self._pending = None
-        tree = self.tree
-        if not tree.winfo_exists():
-            return
-        canvas = self._element_canvas()
-        if canvas is None or not canvas.winfo_exists():
-            # Нет доступа к внутреннему canvas (другая ttk-тема) —
-            # без разделителей таблица работает как раньше.
-            return
-        # Удаляем только свои линии (по тегу) — элементы ttk не трогаем.
-        canvas.delete(self.TAG)
-        cols = tree['columns']
-        if len(cols) < 2:
-            return
-        w = canvas.winfo_width()
-        h = canvas.winfo_height()
-        if w <= 1 or h <= 1:
-            return
-        border = theme.palette().border
-        # Смещение горизонтальной прокрутки: левый край первой колонки
-        # может уходить за видимую область дерева.
-        offset = 0
-        children = tree.get_children()
-        if children:
-            bbox = tree.bbox(children[0], cols[0])
-            if bbox:
-                offset = max(0, -bbox[0])
-        # Границы колонок в координатах content-области: начало области
-        # плюс накопленные ширины колонок минус горизонтальный скролл.
-        x0 = 0
-        first_bbox = tree.bbox('', cols[0]) if children else None
-        if first_bbox:
-            x0 = first_bbox[0] - offset
-        x = x0
-        for c in cols[:-1]:
-            x += self._column_px(c)
-            if 0 < x < w:
-                # Тонкая 1px линия на собственном canvas дерева: она рисуется
-                # поверх фона, но под текстом ячеек и никогда не перекрывает
-                # содержимое таблицы (в отличие от старого окна-оверлея).
-                canvas.create_line(x, 0, x, h, fill=border, width=1,
-                                   tags=(self.TAG,))
-
-    def destroy(self):
-        try:
-            canvas = self._element_canvas()
-            if canvas is not None and canvas.winfo_exists():
-                canvas.delete(self.TAG)
+            if tree.winfo_exists() and tree.winfo_viewable():
+                tree.item(tree, redisplay=True)
         except tk.TclError:
             pass
 
+    def attach(self):
+        """Совместимость со старым кодом: принудительная перерисовка."""
+        self.redraw()
 
+    def place_overlay(self):
+        """Совместимость: оверлей больше не используется."""
+        pass
 
-def _raw_column_width(tree, col):
-    """Реальное значение опции width колонки, минуя прокси-обёртку."""
-    try:
-        return int(tree.tk.call(tree._w, 'column', col, '-width'))  # noqa: SLF001
-    except (tk.TclError, ValueError):
-        return None
+    def set_known_widths(self, widths: dict):
+        """Совместимость: карта ширин не нужна — линии рисует сам ttk."""
+        self.redraw()
+
+    def destroy(self):
+        pass
 
 class DarkTableFrame(ctk.CTkFrame):
     """Панель со Treeview и скроллбарами, исчезающими без необходимости.
