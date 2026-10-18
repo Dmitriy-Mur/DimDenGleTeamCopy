@@ -57,6 +57,258 @@ class AutoScrollbar(ttk.Scrollbar):
         method(*args, **kwargs)
 
 
+class ColumnSeparatorPlugin:
+    """Вертикальные линии-разделители между столбцами Treeview.
+
+    Рисует тонкие линии на canvas-оверлее поверх всей области таблицы
+    (шапка + строки). Canvas прозрачен для событий (inputshape пусто),
+    поэтому клики, выделения и сортировка по заголовкам работают как
+    раньше. Линии синхронизированы с шириной колонок и прокруткой.
+    """
+
+    def __init__(self, tree: ttk.Treeview):
+        self.tree = tree
+        parent = tree.master
+        try:
+            panel_bg = theme.palette().panel_bg
+        except Exception:
+            panel_bg = 'gray'
+        self.canvas = tk.Canvas(
+            parent,
+            highlightthickness=0, bd=0, bg=panel_bg,
+            takefocus=0, cursor='arrow',
+        )
+        # Прозрачность для мыши (Tk >= 8.7): все события проходят к дереву
+        # под оверлеем. На более старом Tk опции нет — тогда оверлей сам
+        # прокидывает клики в дерево (_forward_click).
+        self._inputshape_ok = False
+        try:
+            self.canvas.tk.call(self.canvas._w, 'configure', '-inputshape', '{}')  # noqa: SLF001
+            self._inputshape_ok = True
+        except tk.TclError:
+            self.canvas.bind('<Button-1>', self._forward_click)
+            self.canvas.bind('<Double-1>', self._forward_click)
+        self._pending = None
+        self._job_tree_configure = None
+        # Запрошенные ширины колонок: ttk при stretch возвращает из
+        # column(c,'width') пересчитанное значение, поэтому ведём свою
+        # карту ширин через прокси метода column().
+        self._req_widths = {}
+        self.set_tree_column_proxy()
+        # Поднимаем оверлей сразу после того, как дерево завершило свою
+        # отрисовку — так линии всегда поверх ячеек и шапки.
+        def _raise_overlay(_e=None):
+            try:
+                self.canvas.tk.call('raise', self.canvas._w)  # noqa: SLF001
+            except tk.TclError:
+                pass
+        self.tree.bind('<Expose>', _raise_overlay, add='+')
+        self.tree.bind('<Configure>', self._on_tree_configure, add='+')
+        toplevel = self.tree.winfo_toplevel()
+        toplevel.bind('<<ThemeChanged>>', lambda _e=None: self.redraw(), add='+')
+        self.attach()
+
+    def attach(self):
+        """Разместить оверлей поверх дерева и перерисовать линии."""
+        self.place_overlay()
+        self.redraw()
+
+    def place_overlay(self):
+        """Совместить оверлей с геометрией дерева (в координатах родителя).
+
+        CTkFrame рисует фон на внутреннем canvas, и winfo_x() дочерних
+        ttk-виджетов возвращает координаты относительно этого canvas —
+        поэтому смещение считается через разницу экранных координат.
+        """
+        tree = self.tree
+        parent = tree.master
+        x = tree.winfo_rootx() - parent.winfo_rootx()
+        y = tree.winfo_rooty() - parent.winfo_rooty()
+        w = max(1, tree.winfo_width())
+        h = max(1, tree.winfo_height())
+        try:
+            self.canvas.place(x=x, y=y, width=w, height=h)
+        except tk.TclError:
+            pass
+
+    def _on_tree_configure(self, event):
+        """Перепозиционировать оверлей и перерисовать линии после раскладки."""
+        if event.widget is not self.tree:
+            return
+        if self._job_tree_configure is not None:
+            try:
+                self.tree.after_cancel(self._job_tree_configure)
+            except Exception:
+                pass
+        self._job_tree_configure = self.tree.after_idle(self._sync_and_redraw)
+
+    def _sync_and_redraw(self):
+        self._job_tree_configure = None
+        self.place_overlay()
+        self.redraw()
+
+    def redraw(self):
+        """Отложить перерисовку линий до завершения текущих событий Tk."""
+        if self._pending is not None:
+            try:
+                self.canvas.after_cancel(self._pending)
+            except Exception:
+                pass
+        self._pending = self.canvas.after_idle(self._draw_lines)
+
+    def set_known_widths(self, widths: dict):
+        """Запомнить заданные ширины колонок (до первого перерисовывания)."""
+        for col, value in widths.items():
+            try:
+                self._req_widths[col] = int(value)
+            except (TypeError, ValueError):
+                pass
+        self.redraw()
+
+
+    def _column_px(self, col) -> int:
+        """Фактическая ширина колонки в пикселях.
+
+        При ``stretch=True`` ttk распределяет свободное место между
+        растяжимыми колонками пропорционально их заданным ширинам;
+        реальную итоговую ширину через ``tree.column(c,'width')`` получить
+        нельзя (возвращает запрошенное значение), поэтому считаем её по
+        формуле stretch от ширины области строк. Если строки не видны —
+        берём запрошенную ширину.
+        """
+        tree = self.tree
+        cols = tree['columns']
+        # Запрошенные ширины: из карты (ставится через прокси column()) либо
+        # из текущего значения колонки (до первой установки ширины).
+        requested = {c: self._req_widths.get(c) or _raw_column_width(tree, c) or 120
+                     for c in cols}
+        children = tree.get_children()
+        avail = 0
+        if children:
+            bb = tree.bbox(children[0])
+            if bb:
+                avail = bb[2]
+        total_req = sum(requested.values()) or 1
+        if avail > total_req + 2:
+            extra = avail - total_req
+            stretched = [c for c in cols if tree.column(c, 'stretch')]
+            st_total = sum(requested[c] for c in stretched) or 1
+            width = requested[col]
+            if col in stretched and extra > 0:
+                width += round(extra * requested[col] / st_total)
+            return max(1, width)
+        return max(1, requested[col])
+
+    def set_tree_column_proxy(self):
+        """Проксировать ``tree.column``, запоминая заданные ширины колонок.
+
+        При ``stretch=True`` ttk возвращает из ``column(c, 'width')`` уже
+        пересчитанное значение, а не запрошенное пользователем — без своей
+        карты ширин разделители «съезжают» после изменения ширины колонки.
+        """
+        tree = self.tree
+        if getattr(tree, '_sep_column_patched', False):
+            return
+        original = tree.column
+
+        def column_wrapper(column=None, cnf=None, **kw):
+            # Нормализуем варианты вызова: ('optname', value), ({...},), (**kw)
+            opts = dict(cnf) if isinstance(cnf, dict) else {}
+            if isinstance(cnf, str) and kw:
+                opts.update(kw)
+            elif isinstance(cnf, str):
+                # чтение опции: column(col, 'width') — пробрасываем как есть
+                return original(column, cnf)
+            opts.update(kw)
+            if 'width' in opts:
+                try:
+                    self._req_widths[column] = int(opts['width'])
+                except (TypeError, ValueError):
+                    pass
+            return original(column, opts)
+
+        tree.column = column_wrapper
+        try:
+            tree._sep_column_patched = True
+        except AttributeError:
+            pass
+
+    def _draw_lines(self):
+        self._pending = None
+        canvas = self.canvas
+        tree = self.tree
+        if not canvas.winfo_exists() or not tree.winfo_exists():
+            return
+        canvas.delete('all')
+        cols = tree['columns']
+        if len(cols) < 2:
+            return
+        w = canvas.winfo_width()
+        h = canvas.winfo_height()
+        if w <= 1 or h <= 1:
+            return
+        border = theme.palette().border
+        # Смещение горизонтальной прокрутки: левый край первой колонки
+        # может уходить за видимую область дерева.
+        offset = 0
+        children = tree.get_children()
+        if children:
+            bbox = tree.bbox(children[0], cols[0])
+            if bbox:
+                offset = max(0, -bbox[0])
+        # Границы колонок в координатах дерева: начало content-области плюс
+        # накопленные ширины колонок минус горизонтальный скролл.
+        x0 = 0
+        first_bbox = tree.bbox('', cols[0]) if children else None
+        if first_bbox:
+            x0 = first_bbox[0] - offset
+        x = x0
+        for c in cols[:-1]:
+            x += self._column_px(c)
+            if 0 < x < w:
+                canvas.create_line(x, 0, x, h, fill=border)
+
+    def _forward_click(self, event):
+        """Прокинуть клик из оверлея в дерево (fallback для Tk < 8.7).
+
+        Определяет элемент под курсором: на шапке — выполняет heading
+        command (сортировка), на строке — выделяет её.
+        """
+        tree = self.tree
+        tx = event.x + self.canvas.winfo_x() - tree.winfo_x()
+        ty = event.y + self.canvas.winfo_y() - tree.winfo_y()
+        item = tree.identify_row(ty)
+        if not item and tree.identify_region(tx, ty) == 'heading':
+            col = tree.identify_column(tx)
+            if col and col != '#0':
+                try:
+                    index = int(col[1:]) - 1
+                    cmd = tree.heading(tree['columns'][index], 'command')
+                    if cmd:
+                        tree.tk.eval(cmd)
+                except (ValueError, IndexError, tk.TclError):
+                    pass
+            return 'break'
+        if item:
+            tree.selection_set(item)
+            tree.focus(item)
+        return 'break'
+
+    def destroy(self):
+        try:
+            self.canvas.destroy()
+        except tk.TclError:
+            pass
+
+
+
+def _raw_column_width(tree, col):
+    """Реальное значение опции width колонки, минуя прокси-обёртку."""
+    try:
+        return int(tree.tk.call(tree._w, 'column', col, '-width'))  # noqa: SLF001
+    except (tk.TclError, ValueError):
+        return None
+
 class DarkTableFrame(ctk.CTkFrame):
     """Панель со Treeview и скроллбарами, исчезающими без необходимости.
 
@@ -65,6 +317,8 @@ class DarkTableFrame(ctk.CTkFrame):
       шапка таблицы и тонкие разделители колонок;
     * вертикальный скроллбар появляется только если строк больше, чем видно;
     * горизонтальный — только если колонки не влезают по ширине;
+    * над таблицей нет «выпирающих» полос: разделители рисуются поверх
+      самой таблицы через ``ColumnSeparatorPlugin``;
     * при смене темы (событие ``<<ThemeChanged>>``) перекрашивается сам.
     """
 
@@ -99,40 +353,10 @@ class DarkTableFrame(ctk.CTkFrame):
         self._vbar._auto_place = (self._vbar.pack, (), {'side': 'right', 'fill': 'y'})
         self._hbar._auto_place = (self._hbar.pack, (), {'side': 'bottom', 'fill': 'x'})
 
-        # Полоса разделителей колонок поверх шапки таблицы создаётся здесь,
-        # до раскладки: порядок pack важен — сначала полосы скроллов по
-        # краям, затем Treeview. Иначе при появлении скроллбаров полоса
-        # смещается относительно таблицы и метки колонок «съезжают».
-        self._sep_height = 6
-        self._sep_canvas = tk.Canvas(
-            self, height=self._sep_height, highlightthickness=0, bd=0,
-            bg=pal.header_bg, takefocus=0,
-        )
-
-        # Клик по полосе разделителей (она лежит поверх шапки Treeview и
-        # перехватывает события заголовков) прокидывается в дерево: сортировка
-        # по клику на колонку работает через heading(command=...).
-        def _forward(event):
-            col = self.tree.identify_column(event.x - self.tree.winfo_x())
-            if col and col != '#0':
-                try:
-                    index = int(col[1:]) - 1
-                    cmd = self.tree.heading(self.tree['columns'][index], 'command')
-                    if cmd:
-                        self.tree.tk.eval(cmd)
-                except (ValueError, IndexError, tk.TclError):
-                    pass
-            return 'break'
-
-        self._sep_canvas.bind('<Button-1>', _forward)
-        self._sep_canvas.bind('<Double-1>', _forward)
-
+        # Порядок pack важен: сначала полосы скроллов по краям, затем Treeview.
         self._vbar.pack(side='right', fill='y')
         self._hbar.pack(side='bottom', fill='x')
         self.tree.pack(side='left', fill='both', expand=True)
-        # Поверх шапки Treeview (place не участвует в раскладке pack и не
-        # сдвигает строки таблицы).
-        self._place_separators_strip()
 
         for col in (columns or ()):
             width = (column_widths or {}).get(col, 120)
@@ -140,16 +364,18 @@ class DarkTableFrame(ctk.CTkFrame):
             self.tree.heading(col, text=text, anchor='w')
             self.tree.column(col, width=width, minwidth=60, anchor='w', stretch=True)
 
+        # Разделители между столбцами: прозрачный canvas-оверлей поверх всей
+        # таблицы (не над ней — никаких «выпирающих» полос), синхронный с
+        # ширинами колонок и прокруткой. Создаётся до строковых тегов, но
+        # после настройки колонок, чтобы карта ширин была полной.
+        self._sep_plugin = ColumnSeparatorPlugin(self.tree)
+        self._sep_plugin.set_known_widths({c: (column_widths or {}).get(c, 120)
+                                           for c in (columns or ())})
+
         # Чередование строк для читаемости
         self.tree.tag_configure('oddrow', background=pal.row_alt)
         self.tree.tag_configure('evenrow', background=pal.panel_bg)
         self._row_count = 0
-
-        self._sep_canvas.bind('<Configure>',
-                              lambda e: self.refresh_column_separators())
-        self._sep_pending = None
-        self.tree.bind('<Configure>',
-                       lambda e: self.refresh_column_separators(), add='+')
 
         # Перекраска при переключении темы.
         toplevel = self.winfo_toplevel()
@@ -159,90 +385,21 @@ class DarkTableFrame(ctk.CTkFrame):
     def _on_theme_change(self):
         pal = theme.palette()
         self.configure(fg_color=pal.panel_bg)
-        self._sep_canvas.configure(bg=pal.header_bg)
+        plugin = getattr(self, '_sep_plugin', None)
+        if plugin is not None and plugin.canvas.winfo_exists():
+            # фон оверлея совпадает с фоном панели: под шапкойTreeview он
+            # не виден, а в щели между деревом и скроллбаром не «светится»
+            plugin.canvas.configure(bg=pal.panel_bg)
         self.tree.tag_configure('oddrow', background=pal.row_alt)
         self.tree.tag_configure('evenrow', background=pal.panel_bg)
         self.refresh_column_separators()
 
     # ------------------------------------------------------------- separators
-    def _place_separators_strip(self):
-        """Разместить полосу разделителей поверх шапки Treeview.
-
-        Полоса перекрывает только верхние пиксели заголовков колонок, не
-        участвуя в раскладке pack — строки таблицы не смещаются вниз, а
-        сама полоса всегда точно выровнена по колонкам (в отличие от
-        отдельной строки над таблицей, которая «выезжала» из-за разницы
-        краёв с областью прокрутки).
-        """
-        tree = self.tree
-        # Левый край полосы совпадает с левым краём области строк дерева:
-        # при горизонтальной прокрутке ttk рисует колонки со сдвигом ровно
-        # на эту величину, поэтому разделители остаются под границами
-        # заголовков без дополнительных поправок.
-        try:
-            bbox = tree.bbox('#0')
-        except tk.TclError:
-            bbox = None  # корневой элемент не виден (например, show='headings')
-        left = tree.winfo_x() + (bbox[0] if bbox else 0)
-        width = max(1, tree.winfo_width() - (left - tree.winfo_x()))
-        self._sep_canvas.place(x=left, y=tree.winfo_y(), width=width,
-                               height=self._sep_height, anchor='nw')
-        # place() и так поднимает окно над pack-братьями, но перестрахуемся:
-        # для tk.Canvas tkraise — это метод канваса, а не окна, поэтому
-        # поднимаем окно напрямую через Tk-команду raise.
-        try:
-            self._sep_canvas.tk.call(self._sep_canvas._w, 'raise')  # noqa: SLF001
-        except tk.TclError:
-            pass
-
     def refresh_column_separators(self):
         """Перерисовать вертикальные разделители между колонками Treeview."""
-        if self._sep_pending is not None:
-            try:
-                self.after_cancel(self._sep_pending)
-            except Exception:
-                pass
-        self._sep_pending = self.after_idle(self._redraw_separators)
-
-    def _redraw_separators(self):
-        self._sep_pending = None
-        if not self._sep_canvas.winfo_exists() or not self.tree.winfo_exists():
-            return
-        self._place_separators_strip()
-        self._draw_column_separators()
-
-    def _draw_column_separators(self):
-        canvas = self._sep_canvas
-        tree = self.tree
-        canvas.delete('all')
-        if not canvas.winfo_exists() or not tree.winfo_exists():
-            return
-        w, h = canvas.winfo_width(), canvas.winfo_height()
-        if w <= 1 or h <= 1:
-            return
-        cols = tree['columns']
-        if len(cols) < 2:
-            return
-
-        # Смещение горизонтальной прокрутки: bbox первой колонки при
-        # прокрутке уходит влево за левый край (координата x отрицательна).
-        offset = 0
-        children = tree.get_children()
-        if children:
-            bbox = tree.bbox(children[0], cols[0])
-            if bbox:
-                offset = max(0, -bbox[0])
-
-        # Полоса лежит поверх шапки Treeview; её левый край совпадает с
-        # областью строк — перевод координат через winfo_rootx.
-        dx = tree.winfo_rootx() - canvas.winfo_rootx()
-
-        x = dx - offset
-        border = theme.palette().border
-        for c in cols[:-1]:
-            x += tree.column(c, 'width')
-            if 0 < x < w:
-                canvas.create_line(x, 0, x, h, fill=border)
+        plugin = getattr(self, '_sep_plugin', None)
+        if plugin is not None:
+            plugin.redraw()
 
     def _xview_command(self, *args):
         self.tree.xview(*args)
