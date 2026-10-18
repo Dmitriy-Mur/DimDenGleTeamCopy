@@ -210,3 +210,33 @@ def test_lookup_by_qr(client):
     # Некорректный/чужой QR → 400.
     assert client.get("/lookup", params={"code": "some-other-app:x:1"}).status_code == 400
     assert client.get("/lookup", params={"code": "qwentory:item:abc"}).status_code == 400
+
+
+def test_lookup_resolves_stale_item_id(client):
+    """QR-этикетка `qwentory:item:<id>` печатается по id позиции, а item_id
+    меняется при слиянии остатков (удаление контейнера, если тот же тип уже
+    лежит без коробки). Раньше /lookup по такому «протухшему» id отвечал 404 —
+    Android-сканер не находил часть товаров, видимых в десктопе."""
+    item_type_id = client.post(
+        "/item-types", json={"name": "Протухший QR", "weight_g": 10}
+    ).json()["id"]
+    box_id = client.post(
+        "/boxes", json={"name": "Коробка QR stale", "box_type_id": 1}
+    ).json()["id"]
+
+    stale_id = client.post(
+        "/items", json={"item_type_id": item_type_id, "box_id": box_id, "quantity": 5}
+    ).json()["id"]
+    # Та же позиция вне коробки: при удалении контейнера остатки сольются в неё.
+    unboxed_id = client.post(
+        "/items", json={"item_type_id": item_type_id, "quantity": 2}
+    ).json()["id"]
+
+    client.delete(f"/boxes/{box_id}")
+
+    lookup = client.get("/lookup", params={"code": f"qwentory:item:{stale_id}"})
+    assert lookup.status_code == 200
+    body = lookup.json()
+    assert body["kind"] == "item"
+    assert body["item"]["id"] == unboxed_id
+    assert body["item"]["quantity"] == 7

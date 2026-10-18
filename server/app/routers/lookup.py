@@ -4,7 +4,7 @@ from app.database import db_session
 from app.protocol import parse_qr_payload
 from app.routers.boxes import BOX_SELECT, _row_to_dict, get_box_contents_payload
 from app.routers.item_types import ITEM_TYPE_SELECT_BY_ID
-from app.routers.items import ITEM_SELECT, item_row_to_dict
+from app.routers.items import ITEM_SELECT, _resolve_item_id, item_row_to_dict
 
 
 router = APIRouter(tags=["Lookup"])
@@ -25,9 +25,14 @@ def lookup(code: str):
     # содержимое читаются в рамках одной сессии, а не в нескольких.
     with db_session() as db:
         if kind == "item":
+            # Устаревший id (пересозданная позиция) разрешаем так же, как в
+            # GET /items/{id}: QR-этикетку `qwentory:item:<id>` десктоп печатает
+            # по id позиции, а item_id меняется при слиянии остатков. Без этого
+            # сканер в Android не находил часть товаров («Item not found» на
+            # полностью валидной этикетке).
             row = db.execute(
                 ITEM_SELECT + " WHERE i.item_id = ?",
-                (entity_id,),
+                (_resolve_item_id(db, entity_id),),
             ).fetchone()
             if row is None:
                 raise HTTPException(status_code=404, detail="Item not found")
