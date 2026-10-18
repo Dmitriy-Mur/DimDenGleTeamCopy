@@ -2,6 +2,7 @@ package com.example.warehouse.data.api;
 
 import com.example.warehouse.data.model.BoxContents;
 import com.example.warehouse.data.model.BoxNode;
+import com.example.warehouse.data.model.ItemSummary;
 import com.example.warehouse.data.model.ItemTypeSummary;
 import com.example.warehouse.data.model.LookupResult;
 
@@ -14,8 +15,6 @@ import retrofit2.http.GET;
 import retrofit2.http.PATCH;
 import retrofit2.http.Path;
 import retrofit2.http.Query;
-
-import com.example.warehouse.data.model.ItemTypeSummary;
 
 /**
  * Сервер работает без аутентификации, поэтому запросы отправляются без токена.
