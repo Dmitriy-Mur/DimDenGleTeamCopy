@@ -133,17 +133,11 @@ def apply_ttk_theme() -> None:
         darkcolor=pal.panel_bg,
         relief='flat',
     )
-    # Разделители между столбцами: рисуем рамкой ячейки ``::text``
-    # (borderwidth + orient='vertical' + bordercolor) — линии живут внутри
-    # таблицы, не перекрывают текст и не требуют canvas-оверлеев.
-    try:
-        style.element_options('Treeview.cell')
-        style.configure('Treeview.Cell',
-                        borderwidth=1, relief='solid',
-                        bordercolor=pal.border, lightcolor=pal.border,
-                        darkcolor=pal.border)
-    except tk.TclError:
-        pass
+    # Разделители между столбцами рисует ColumnSeparatorPlugin (ui.widgets):
+    # у элементов Treeview.cell / Treeheading.cell в ttk нет настраиваемых
+    # опций (element_options возвращает пустой кортеж), поэтому задать им
+    # рамку через style.configure невозможно — линии рисуются на canvas-
+    # подложке под таблицей. Здесь только отключаем лишние рамки/отступы.
     style.configure(
         'App.Treeview.Heading',
         background=pal.header_bg,
@@ -157,12 +151,9 @@ def apply_ttk_theme() -> None:
     )
     try:
         style.element_options('Treeheading.cell')
-        style.configure('Treeview.HeadingCell',
-                        borderwidth=1, relief='solid',
-                        bordercolor=pal.border, lightcolor=pal.border,
-                        darkcolor=pal.border)
     except tk.TclError:
         pass
+
     style.map(
         'App.Treeview',
         background=[('selected', pal.selected)],
