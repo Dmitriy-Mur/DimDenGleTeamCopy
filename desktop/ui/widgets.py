@@ -219,10 +219,34 @@ class DarkScrollableFrame(ctk.CTkScrollableFrame):
     BAR_WIDTH = 12
     BAR_TROUGH = 'transparent'
 
+    def _hide_native_scrollbar(self):
+        """Убрать встроенный CTkScrollbar из разметки.
+
+        customtkinter размещает его в сетке навсегда — полоса видна даже
+        когда содержимое помещается целиком, а поверх неё фон родительской
+        рамки делает её неоткликаемой. Виджет остаётся жив (на него
+        ссылается внутренний API библиотеки), но исчезает из разметки.
+        Вызывается и после смены corner_radius/border_width/label_text,
+        потому что ``_create_grid`` возвращает полосу в сетку.
+        """
+        scrollbar = getattr(self, '_scrollbar', None)
+        if scrollbar is not None:
+            try:
+                scrollbar.grid_forget()
+            except Exception:
+                pass
+
+    def _create_grid(self):
+        super()._create_grid()
+        self._hide_native_scrollbar()
+
     def __init__(self, master, **kwargs):
         kwargs.setdefault('fg_color', 'transparent')
         kwargs.setdefault('label_text', '')
         super().__init__(master, **kwargs)
+
+        # Полосы во всей сетке больше нет: ни следа от встроенного скроллбара.
+        self._hide_native_scrollbar()
 
         # Родительский CTkFrame перерисовывает свой canvas при любом
         # изменении размера — после этого перерисуем и наш скроллбар,
@@ -238,7 +262,10 @@ class DarkScrollableFrame(ctk.CTkScrollableFrame):
             bd=0,
             bg=self._canvas_bg(),
         )
-        self._auto_bar.place(x=-self._apply_widget_scaling(self.BAR_WIDTH + 6), rely=0.5,
+        # Ползунок прижат к правому краю панели; координаты задаются через
+        # relx+anchor, а не отрицательным x — иначе полоса уходила за левый
+        # край и не отвечала на клики.
+        self._auto_bar.place(relx=1.0, x=-self._apply_widget_scaling(4), rely=0.5,
                              anchor='e', relheight=0.94)
         self._auto_bar.bind('<Button-1>', self._bar_clicked)
         self._auto_bar.bind('<B1-Motion>', self._bar_drag)
