@@ -140,7 +140,11 @@ public class ItemManageActivity extends AppCompatActivity {
             toast("Количество не изменилось");
             return;
         }
-        patch(ItemUpdateBody.quantity(quantity), true);
+        // Текущие контейнер/тип подставляются в тело: Gson с serializeNulls
+        // отправил бы null, и сервер прочёл бы это как намерения «вынуть из
+        // контейнера» / «сменить тип на null» («Item type not found»).
+        patch(ItemUpdateBody.quantity(quantity)
+                        .withCurrent(item.box_id, item.item_type_id), true);
     }
 
     /** Диалог смены типа товара: список справочника GET /item-types. */
@@ -173,7 +177,12 @@ public class ItemManageActivity extends AppCompatActivity {
                 new AlertDialog.Builder(ItemManageActivity.this)
                         .setTitle("Новый тип товара")
                         .setItems(labels, (dialog, which) ->
-                                patch(ItemUpdateBody.itemType(types.get(which).id), true))
+                                patch(ItemUpdateBody.itemType(types.get(which).id)
+                                                // Текущий контейнер подставляется в тело,
+                                                // чтобы null в box_id не «вынул» позицию
+                                                // из контейнера (товар исчезал из списка).
+                                                .withCurrent(item.box_id, item.item_type_id),
+                                        true))
                         .setNegativeButton("Отмена", null)
                         .show();
             }

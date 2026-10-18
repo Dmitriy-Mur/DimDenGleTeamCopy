@@ -21,7 +21,11 @@ class ItemCreate(BaseModel):
 class ItemUpdate(BaseModel):
     model_config = ConfigDict(extra="forbid")
 
-    quantity: int | None = Field(default=None, gt=0)
+    # Проверка gt=0 снята с type-уровня и выполняется ниже вручную:
+    # мобильное приложение (Gson serializeNulls) шлёт все поля тела сразу,
+    # и null в quantity — это «не менять», а не ошибка. Валидация значения
+    # осталась в обработчике (см. update_item).
+    quantity: int | None = None
     box_id: int | None = None
     item_type_id: int | None = None
 
@@ -118,36 +122,44 @@ def get_items(
     return [item_row_to_dict(row) for row in rows]
 
 
+def _resolve_item_id(db, item_id: int) -> int | None:
+    """Разрешение устаревшего id позиции (тот же fallback, что и в get_item).
+
+    Возвращает актуальный item_id либо исходный, если разрешить нечего.
+    Нужен потому, что QR-этикетки (`qwentory:item:<id>`) десктоп печатает по
+    id позиции, а `item_id` меняется при пересоздании записей (слияние
+    остатков при удалении контейнера, повторный обход seed-скрипта). Без
+    разрешения GET /items/{id} находил позицию через fallback, а PATCH/DELETE
+    по тому же id падали с «Item not found» — приложение редактировало чужую
+    запись или не находила её вовсе.
+    """
+    if db.execute("SELECT 1 FROM item WHERE item_id = ?", (item_id,)).fetchone():
+        return item_id
+    if item_id > 0 and db.execute(
+        "SELECT 1 FROM item_type WHERE item_type_id = ?", (item_id,)
+    ).fetchone():
+        row = db.execute(
+            "SELECT item_id FROM item"
+            " WHERE item_type_id = ?"
+            " ORDER BY (box_id IS NULL), item_id"
+            " LIMIT 1",
+            (item_id,),
+        ).fetchone()
+        if row is not None:
+            return row["item_id"]
+    return item_id
+
+
 @router.get("/{item_id}")
 def get_item(item_id: int):
     """Позиция по id.
 
-    QR-этикетки (`qwentory:item:<id>`) формируются десктопом по id позиции,
-    но позиция живёт в таблице `item`, а её `item_id` меняется при
-    пересоздании записей (слияние остатков при удалении контейнера, повторный
-    обход seed-скрипта после удаления БД). Если позиции с таким id больше нет,
-    пробуем найти запись того же типа товара — иначе приложение получало
-    «Item not found» на полностью валидной этикетке.
+    Если позиции с таким id больше нет, пробуем найти запись того же типа
+    товара (_resolve_item_id) — иначе приложение получало «Item not found»
+    на полностью валидной этикетке.
     """
     with db_session() as db:
-        row = _fetch_item_row(db, item_id)
-
-        if row is None and item_id > 0:
-            # Такого item_id нет, но тип с позициями может существовать:
-            # берём первую позицию этого типа (сначала — из контейнера).
-            type_exists = db.execute(
-                "SELECT 1 FROM item_type WHERE item_type_id = ?",
-                (item_id,),
-            ).fetchone()
-            if type_exists is not None:
-                row = db.execute(
-                    ITEM_SELECT + """
-                    WHERE i.item_type_id = ?
-                    ORDER BY (i.box_id IS NULL), i.item_id
-                    LIMIT 1
-                    """,
-                    (item_id,),
-                ).fetchone()
+        row = _fetch_item_row(db, _resolve_item_id(db, item_id))
 
     if row is None:
         raise HTTPException(
@@ -207,23 +219,42 @@ def create_item(item: ItemCreate):
 
 @router.patch("/{item_id}")
 def update_item(item_id: int, update: ItemUpdate):
-    # Проверяем, что пользователь действительно
-    # передал хотя бы одно поле.
-    if not update.model_fields_set:
+    # «Что менять» определяем по НЕнулевым полям. Это важно для мобильного
+    # приложения: Gson с serializeNulls шлёт тело целиком ({"quantity": 5,
+    # "box_id": null, "item_type_id": null}), и раньше сервер принимал null в
+    # item_type_id за намерение сменить тип, валидировал его как id типа и
+    # отвечал «Item type not found» на обычное изменение количества.
+    # Явное «вынуть из контейнера» (box_id = null) приложение присылает вместе
+    # с текущим типом — оно обрабатывается ниже по model_fields_set.
+    changed_fields = {
+        name for name in ("quantity", "box_id", "item_type_id")
+        if getattr(update, name) is not None
+    }
+    move_out_requested = (
+        "box_id" in update.model_fields_set and update.box_id is None
+    )
+    if not changed_fields and not move_out_requested:
         raise HTTPException(
             status_code=400,
             detail="Nothing to update: provide quantity and/or box_id"
         )
 
+    if update.quantity is not None and update.quantity <= 0:
+        raise HTTPException(
+            status_code=422,
+            detail="Quantity must be greater than 0"
+        )
+
     try:
         with db_session() as db:
+            target_id = _resolve_item_id(db, item_id)
             current = db.execute(
                 """
                 SELECT item_id, box_id, item_type_id
                 FROM item
                 WHERE item_id = ?
                 """,
-                (item_id,)
+                (target_id,)
             ).fetchone()
 
             if current is None:
@@ -231,13 +262,16 @@ def update_item(item_id: int, update: ItemUpdate):
                     status_code=404,
                     detail="Item not found"
                 )
+            item_id = current["item_id"]
 
-            if "box_id" in update.model_fields_set:
+            if move_out_requested:
+                new_box_id = None
+            elif "box_id" in changed_fields:
                 new_box_id = update.box_id
             else:
                 new_box_id = current["box_id"]
 
-            if "item_type_id" in update.model_fields_set:
+            if "item_type_id" in changed_fields:
                 new_type_id = update.item_type_id
                 type_exists = db.execute(
                     "SELECT 1 FROM item_type WHERE item_type_id = ?",
@@ -287,9 +321,13 @@ def update_item(item_id: int, update: ItemUpdate):
 @router.delete("/{item_id}")
 def delete_item(item_id: int):
     with db_session() as db:
+        # Устаревший id (пересозданная позиция) разрешаем так же, как в GET —
+        # иначе приложение удаляло бы чужую запись или получало 404 на
+        # валидной этикетке.
+        target_id = _resolve_item_id(db, item_id)
         cursor = db.execute(
             "DELETE FROM item WHERE item_id = ?",
-            (item_id,)
+            (target_id,)
         )
 
         if cursor.rowcount == 0:
