@@ -26,7 +26,6 @@ class ThemePalette:
     selected_text: str    # текст на выделении
     row_alt: str          # альтернативная (чётная) строка таблицы
     hover: str            # подсветка строк дерева при наведении
-    scrollbar: str        # ползунок скроллбара
 
 
 LIGHT = ThemePalette(
@@ -40,7 +39,6 @@ LIGHT = ThemePalette(
     selected_text='#ffffff',
     row_alt='#f2f5f9',
     hover='#e3e7ec',
-    scrollbar='#b9bec5',
 )
 
 DARK = ThemePalette(
@@ -54,7 +52,6 @@ DARK = ThemePalette(
     selected_text='#ffffff',
     row_alt='#2c2d30',
     hover='#3a3d41',
-    scrollbar='#5c5c5c',
 )
 
 PALETTES = {'light': LIGHT, 'dark': DARK}
@@ -117,7 +114,7 @@ def _walk(widget: tk.Misc):
 
 
 def apply_ttk_theme() -> None:
-    """Настроить стили ttk (Treeview, Scrollbar) под текущую тему."""
+    """Настроить стили ttk (Treeview) под текущую тему."""
     pal = palette()
     style = ttk.Style()
     try:
@@ -177,13 +174,3 @@ def apply_ttk_theme() -> None:
         foreground=[('active', pal.text)],
     )
 
-    for orient in ('Vertical', 'Horizontal'):
-        style.configure(
-            f'App.{orient}.TScrollbar',
-            background=pal.scrollbar,
-            troughcolor=pal.panel_bg,
-            bordercolor=pal.border,
-            arrowcolor=pal.text,
-            lightcolor=pal.scrollbar,
-            darkcolor=pal.scrollbar,
-        )
