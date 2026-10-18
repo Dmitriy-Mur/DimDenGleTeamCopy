@@ -60,34 +60,18 @@ class AutoScrollbar(ttk.Scrollbar):
 class ColumnSeparatorPlugin:
     """Вертикальные линии-разделители между столбцами Treeview.
 
-    Рисует тонкие линии на canvas-оверлее поверх всей области таблицы
-    (шапка + строки). Canvas прозрачен для событий (inputshape пусто),
-    поэтому клики, выделения и сортировка по заголовкам работают как
-    раньше. Линии синхронизированы с шириной колонок и прокруткой.
+    Раньше разделители рисовались окном-оверлеем (tk.Canvas) поверх дерева,
+    и на Windows это полностью перекрывало содержимое таблицы — видны
+    оставались только сами линии. Теперь оверлея нет вообще: плагин
+    подмешивает тонкие 1px линии в элемент ``::text`` собственного canvas
+    Treeview (внутренний widget ttk-дерева). Линии живут внутри таблицы,
+    перерисовываются вместе с ней и никогда не закрывают текст ячеек.
     """
+
+    TAG = 'col_separators'
 
     def __init__(self, tree: ttk.Treeview):
         self.tree = tree
-        parent = tree.master
-        try:
-            panel_bg = theme.palette().panel_bg
-        except Exception:
-            panel_bg = 'gray'
-        self.canvas = tk.Canvas(
-            parent,
-            highlightthickness=0, bd=0, bg=panel_bg,
-            takefocus=0, cursor='arrow',
-        )
-        # Прозрачность для мыши (Tk >= 8.7): все события проходят к дереву
-        # под оверлеем. На более старом Tk опции нет — тогда оверлей сам
-        # прокидывает клики в дерево (_forward_click).
-        self._inputshape_ok = False
-        try:
-            self.canvas.tk.call(self.canvas._w, 'configure', '-inputshape', '{}')  # noqa: SLF001
-            self._inputshape_ok = True
-        except tk.TclError:
-            self.canvas.bind('<Button-1>', self._forward_click)
-            self.canvas.bind('<Double-1>', self._forward_click)
         self._pending = None
         self._job_tree_configure = None
         # Запрошенные ширины колонок: ttk при stretch возвращает из
@@ -95,41 +79,35 @@ class ColumnSeparatorPlugin:
         # карту ширин через прокси метода column().
         self._req_widths = {}
         self.set_tree_column_proxy()
-        # Поднимаем оверлей сразу после того, как дерево завершило свою
-        # отрисовку — так линии всегда поверх ячеек и шапки.
-        def _raise_overlay(_e=None):
-            try:
-                self.canvas.tk.call('raise', self.canvas._w)  # noqa: SLF001
-            except tk.TclError:
-                pass
-        self.tree.bind('<Expose>', _raise_overlay, add='+')
-        self.tree.bind('<Configure>', self._on_tree_configure, add='+')
+        tree.bind('<Configure>', self._on_tree_configure, add='+')
         toplevel = self.tree.winfo_toplevel()
         toplevel.bind('<<ThemeChanged>>', lambda _e=None: self.redraw(), add='+')
-        self.attach()
+        self.redraw()
+
+    @property
+    def canvas(self):
+        """Внутренний canvas Treeview (для совместимости со старым кодом)."""
+        return self._element_canvas()
 
     def attach(self):
-        """Разместить оверлей поверх дерева и перерисовать линии."""
-        self.place_overlay()
+        """Совместимость: перерисовать линии."""
         self.redraw()
 
     def place_overlay(self):
-        """Совместить оверлей с геометрией дерева (в координатах родителя).
+        """Совместимость: оверлей больше не размещается — линии на дереве."""
+        pass
 
-        CTkFrame рисует фон на внутреннем canvas, и winfo_x() дочерних
-        ttk-виджетов возвращает координаты относительно этого canvas —
-        поэтому смещение считается через разницу экранных координат.
-        """
-        tree = self.tree
-        parent = tree.master
-        x = tree.winfo_rootx() - parent.winfo_rootx()
-        y = tree.winfo_rooty() - parent.winfo_rooty()
-        w = max(1, tree.winfo_width())
-        h = max(1, tree.winfo_height())
+    def _element_canvas(self):
+        """Возвращает tk.Canvas элемента ``::text`` или None."""
         try:
-            self.canvas.place(x=x, y=y, width=w, height=h)
-        except tk.TclError:
-            pass
+            w = self.tree.tk.call(self.tree._w, 'element', 'cget',  # noqa: SLF001
+                                  '::text', '-widget')
+            if not w:
+                return None
+            widget = self.tree.nametowidget(w)
+            return widget if isinstance(widget, tk.Canvas) else None
+        except (tk.TclError, KeyError, ValueError):
+            return None
 
     def _on_tree_configure(self, event):
         """Перепозиционировать оверлей и перерисовать линии после раскладки."""
@@ -144,7 +122,6 @@ class ColumnSeparatorPlugin:
 
     def _sync_and_redraw(self):
         self._job_tree_configure = None
-        self.place_overlay()
         self.redraw()
 
     def redraw(self):
@@ -235,11 +212,16 @@ class ColumnSeparatorPlugin:
 
     def _draw_lines(self):
         self._pending = None
-        canvas = self.canvas
         tree = self.tree
-        if not canvas.winfo_exists() or not tree.winfo_exists():
+        if not tree.winfo_exists():
             return
-        canvas.delete('all')
+        canvas = self._element_canvas()
+        if canvas is None or not canvas.winfo_exists():
+            # Нет доступа к внутреннему canvas (другая ttk-тема) —
+            # без разделителей таблица работает как раньше.
+            return
+        # Удаляем только свои линии (по тегу) — элементы ttk не трогаем.
+        canvas.delete(self.TAG)
         cols = tree['columns']
         if len(cols) < 2:
             return
@@ -256,8 +238,8 @@ class ColumnSeparatorPlugin:
             bbox = tree.bbox(children[0], cols[0])
             if bbox:
                 offset = max(0, -bbox[0])
-        # Границы колонок в координатах дерева: начало content-области плюс
-        # накопленные ширины колонок минус горизонтальный скролл.
+        # Границы колонок в координатах content-области: начало области
+        # плюс накопленные ширины колонок минус горизонтальный скролл.
         x0 = 0
         first_bbox = tree.bbox('', cols[0]) if children else None
         if first_bbox:
@@ -266,37 +248,17 @@ class ColumnSeparatorPlugin:
         for c in cols[:-1]:
             x += self._column_px(c)
             if 0 < x < w:
-                canvas.create_line(x, 0, x, h, fill=border)
-
-    def _forward_click(self, event):
-        """Прокинуть клик из оверлея в дерево (fallback для Tk < 8.7).
-
-        Определяет элемент под курсором: на шапке — выполняет heading
-        command (сортировка), на строке — выделяет её.
-        """
-        tree = self.tree
-        tx = event.x + self.canvas.winfo_x() - tree.winfo_x()
-        ty = event.y + self.canvas.winfo_y() - tree.winfo_y()
-        item = tree.identify_row(ty)
-        if not item and tree.identify_region(tx, ty) == 'heading':
-            col = tree.identify_column(tx)
-            if col and col != '#0':
-                try:
-                    index = int(col[1:]) - 1
-                    cmd = tree.heading(tree['columns'][index], 'command')
-                    if cmd:
-                        tree.tk.eval(cmd)
-                except (ValueError, IndexError, tk.TclError):
-                    pass
-            return 'break'
-        if item:
-            tree.selection_set(item)
-            tree.focus(item)
-        return 'break'
+                # Тонкая 1px линия на собственном canvas дерева: она рисуется
+                # поверх фона, но под текстом ячеек и никогда не перекрывает
+                # содержимое таблицы (в отличие от старого окна-оверлея).
+                canvas.create_line(x, 0, x, h, fill=border, width=1,
+                                   tags=(self.TAG,))
 
     def destroy(self):
         try:
-            self.canvas.destroy()
+            canvas = self._element_canvas()
+            if canvas is not None and canvas.winfo_exists():
+                canvas.delete(self.TAG)
         except tk.TclError:
             pass
 
@@ -385,11 +347,6 @@ class DarkTableFrame(ctk.CTkFrame):
     def _on_theme_change(self):
         pal = theme.palette()
         self.configure(fg_color=pal.panel_bg)
-        plugin = getattr(self, '_sep_plugin', None)
-        if plugin is not None and plugin.canvas.winfo_exists():
-            # фон оверлея совпадает с фоном панели: под шапкойTreeview он
-            # не виден, а в щели между деревом и скроллбаром не «светится»
-            plugin.canvas.configure(bg=pal.panel_bg)
         self.tree.tag_configure('oddrow', background=pal.row_alt)
         self.tree.tag_configure('evenrow', background=pal.panel_bg)
         self.refresh_column_separators()
