@@ -10,7 +10,18 @@ import java.util.List;
  */
 public class BoxContents {
     public int box_id;
+
+    /**
+     * Сервер отдаёт товары под ключом {@code items}, вложенные контейнеры —
+     * под {@code child_boxes}. Gson сопоставляет Java-поля по именам, поэтому
+     * без @SerializedName оба списка после разбора оставались пустыми:
+     * в приложении не отображались ни товары, ни вложенные коробки (в отличие
+     * от десктопа, который читает эти ключи напрямую).
+     */
+    @SerializedName("items")
     public List<ItemRow> items = new ArrayList<>();
+
+    @SerializedName("child_boxes")
     public List<ChildBox> child_boxes = new ArrayList<>();
 
     public static class ItemRow {
