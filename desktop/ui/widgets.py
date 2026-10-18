@@ -36,46 +36,181 @@ DARK_SELECTED = theme.DARK.selected
 class ColumnSeparatorPlugin:
     """Вертикальные линии-разделители между столбцами Treeview.
 
-    Реализация опирается на штатный механизм ttk: элемент ``::text``
-    (экземпляр ``Treeview.Cell``) рисуется для каждой ячейки, и если у
-    этого типа элементов включена однопиксельная рамка цвета границы
-    (настраивается в ``ui.theme.apply_ttk_theme``), то между столбцами
-    появляются ровные разделительные линии на всю высоту таблицы —
-    включая шапку (через ``Treeheading.cell``).
+    Штатными средствами ttk нарисовать такие линии нельзя: в макете
+    стиля ``clam`` строки таблицы рисуются элементом ``Treeitems``, а
+    типы элементов ``Treeview.cell`` / ``Treeheading.cell`` не имеют
+    настраиваемых опций (``style.element_options(...)`` возвращает пустой
+    кортеж), поэтому любые попытки задать им рамку молча игнорировались —
+    именно из-за этого разделителей между столбцами не было.
 
-    Никаких canvas-оверлеев поверх таблицы больше нет: раньше они
-    перекрывали содержимое (было видно только линии) и обращались к
-    несуществующему API (``element cget ::text -widget``), из-за чего
-    приложение падало с ``AttributeError``. Плагин сводится к безопасному
-    вызову перерисовки; сам он не создаёт новых окон и ничего не рисует.
+    Теперь линии рисуются на собственном tk.Canvas, который лежит под
+    деревом в ``lower()`` стопорядке: он существует для отрисовки линий,
+    но мышь по-прежнему попадает в таблицу (клик/перетаскивание не
+    перехватываются). Линии считаются по реальным границам колонок
+    (``tree.winfo_x`` + смещение горизонтального пролистывания +
+    ``tree.column(col, 'xscale')``), поэтому совпадают с сеткой даже при
+    растягивании колонок и прокрутке колесом.
+
+    Публичный API прежний: ``attach()``, ``redraw()``, ``place_overlay()``,
+    ``set_known_widths()``, ``destroy()``.
     """
+
+    _PENDING_MS = 60  # объединение частых перерисовок в одну
 
     def __init__(self, tree: ttk.Treeview):
         self.tree = tree
+        self._known_widths: dict = {}
+        self._canvas = None
+        self._after_id = None
+        self._bound = False
+        self._redraw_pending = False
 
-    def redraw(self):
-        """Перерисовать дерево, чтобы ttk заново отрисовал рамки ячеек."""
-        tree = self.tree
-        try:
-            if tree.winfo_exists() and tree.winfo_viewable():
-                tree.item(tree, redisplay=True)
-        except tk.TclError:
-            pass
-
+    # ------------------------------------------------------------------ setup
     def attach(self):
-        """Совместимость со старым кодом: принудительная перерисовка."""
+        """Создать слой-подложку и подписать события перестройки таблицы."""
+        tree = self.tree
+        if not tree.winfo_exists():
+            return
+        parent = tree.master
+
+        if self._canvas is None or not self._canvas.winfo_exists():
+            pal = theme.palette()
+            self._canvas = tk.Canvas(parent, highlightthickness=0, bd=0,
+                                     bg=pal.panel_bg)
+            self._canvas.bind('<Configure>', lambda _e: self.redraw())
+
+        # Тот же размер и позиция, что у дерева; ниже дерева по стопорядку
+        # (у Canvas метод .lower() переопределён под теги, поэтому «понизить
+        # сам виджет» вызываем через BaseWidget.lower), чтобы линиями нельзя
+        # было перехватить клики мыши.
+        self._canvas.place(x=tree.winfo_x(), y=tree.winfo_y(),
+                           width=tree.winfo_width(), height=tree.winfo_height())
+        tk.BaseWidget.lower(self._canvas)
+
+        if not self._bound:
+            self._bound = True
+            tree.bind('<Configure>', lambda _e: self.redraw(), add='+')
+            for seq in ('<ButtonRelease-1>', '<MouseWheel>', '<Key>',
+                        '<Button-4>', '<Button-5>'):
+                tree.bind(seq, lambda _e: self._schedule_redraw(), add='+')
         self.redraw()
 
     def place_overlay(self):
-        """Совместимость: оверлей больше не используется."""
-        pass
+        """Совместимость со старым кодом: то же, что attach()."""
+        self.attach()
 
     def set_known_widths(self, widths: dict):
-        """Совместимость: карта ширин не нужна — линии рисует сам ttk."""
-        self.redraw()
+        """Запомнить исходные ширины колонок (для перерисовки после смены темы)."""
+        self._known_widths = dict(widths or {})
+        self.attach()
 
     def destroy(self):
-        pass
+        if self._after_id is not None:
+            try:
+                self.tree.after_cancel(self._after_id)
+            except Exception:
+                pass
+            self._after_id = None
+        if self._canvas is not None:
+            try:
+                self._canvas.destroy()
+            except tk.TclError:
+                pass
+            self._canvas = None
+
+    # ------------------------------------------------------------- rendering
+    def _schedule_redraw(self):
+        """Отложить перерисовку: линии считают геометрию после неё."""
+        if self._after_id is not None:
+            return
+        try:
+            self._after_id = self.tree.after(self._PENDING_MS, self._on_pending)
+        except tk.TclError:
+            self._after_id = None
+
+    def _on_pending(self):
+        self._after_id = None
+        self.redraw()
+
+    def redraw(self):
+        """Перерисовать вертикальные линии по текущим границам колонок."""
+        tree = self.tree
+        canvas = self._canvas
+        try:
+            if not tree.winfo_exists() or canvas is None or not canvas.winfo_exists():
+                return
+            if not tree.winfo_viewable():
+                return
+        except tk.TclError:
+            return
+
+        # Не перерисовывать рекурсивно внутри обработчика <Configure>.
+        if self._redraw_pending:
+            return
+        self._redraw_pending = True
+        try:
+            self._do_redraw()
+        finally:
+            self._redraw_pending = False
+
+    def _do_redraw(self):
+        tree = self.tree
+        canvas = self._canvas
+
+        # Подгоняем слой под дерево (после pack/place самого дерева).
+        self._canvas.place(x=tree.winfo_x(), y=tree.winfo_y(),
+                           width=max(1, tree.winfo_width()),
+                           height=max(1, tree.winfo_height()))
+
+        cols = list(tree['columns'])
+        if not cols:
+            return
+
+        pal = theme.palette()
+        color = pal.border
+        # фон подложки = фон таблицы текущей темы (под таблицей её не видно)
+        self._canvas.configure(bg=pal.panel_bg)
+
+        # Верхняя граница линий: y первой строки (низ шапки); если строк нет
+        # или они прокручены — сразу под заголовками (identify_region).
+        top = 0
+        try:
+            kids = tree.get_children()
+            bb = tree.bbox(kids[0]) if kids else None
+            if bb:
+                top = bb[1]
+            elif tree.identify_region(2, 2) == 'heading':
+                top = tree.identify_row(2) or 0
+        except (IndexError, tk.TclError):
+            pass
+        bottom = max(top, self._canvas.winfo_height())
+
+        # Смещение горизонтального пролистывания (без скроллбара обычно 0).
+        xoff = 0
+        try:
+            frac = float(tree.xview()[0])
+            if 0.0 < frac < 1.0:
+                total_w = sum(int(tree.column(c, 'width')) for c in cols)
+                xoff = int(round(frac * total_w / (1.0 - frac)))
+        except (TypeError, ValueError, tk.TclError):
+            xoff = 0
+
+        self._canvas.delete('vsep')
+        last = len(cols) - 1
+        for i, col in enumerate(cols):
+            if i == last:
+                break
+            try:
+                xscale = float(tree.column(col, 'xscale'))
+            except (TypeError, ValueError, tk.TclError):
+                continue
+            if xscale <= 0:
+                continue
+            # xscale — доля ширины колонки в видимой области дерева.
+            x = round(tree.winfo_width() * xscale)
+            if 0 < x < self._canvas.winfo_width():
+                self._canvas.create_line(x, top, x, bottom,
+                                         fill=color, width=1, tags='vsep')
 
 class DarkTableFrame(ctk.CTkFrame):
     """Панель со Treeview без рамок и без полос прокрутки.
