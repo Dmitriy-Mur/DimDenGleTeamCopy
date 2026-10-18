@@ -31,6 +31,38 @@ from urllib.request import Request, urlopen
 
 API_BASE_URL = os.getenv("API_BASE_URL", "http://api:8000").rstrip("/")
 
+# --------------------------------------------------------------------------
+# Вспомогательные функции
+# --------------------------------------------------------------------------
+
+def _is_running_in_docker() -> bool:
+    """Определяет, запущен ли процесс внутри Docker-контейнера."""
+    try:
+        with open("/.dockerenv", "r") as f:
+            return True
+    except FileNotFoundError:
+        return False
+
+def _get_helpful_error_message(url: str) -> str:
+    """Возвращает полезное сообщение об ошибке для неудачной попытки подключения к API."""
+    if url == "http://api:8000":
+        if _is_running_in_docker():
+            return (
+                f"API недоступен ({url}). "
+                "Если вы запускаете эмулятор внутри Docker, убедитесь, что сервис 'api' запущен. "
+                "Если вы запускаете эмулятор на хосте, установите переменную окружения API_BASE_URL, "
+                "например, API_BASE_URL=http://127.0.0.1:8000"
+            )
+        else:
+            return (
+                f"API недоступен ({url}). "
+                "Эмулятор ожидает API по адресу 'http://api:8000', который является Docker-internal hostname. "
+                "Если вы запускаете эмулятор на хосте, установите переменную окружения API_BASE_URL, "
+                "например, API_BASE_URL=http://127.0.0.1:8000. "
+                "Если вы хотите использовать Docker, запустите эмулятор через docker compose."
+            )
+    return f"API недоступен ({url})"
+
 # Физический порт. Пусто (по умолчанию) — работа в режиме симуляции.
 SERIAL_PORT = os.getenv("SERIAL_PORT", "")
 
@@ -43,6 +75,14 @@ PUBLISH_INTERVAL = float(os.getenv("PUBLISH_INTERVAL", "1.0"))
 # Границы «правдоподобного» веса для симуляции.
 SIM_MIN_WEIGHT = float(os.getenv("SIM_MIN_WEIGHT", "0"))
 SIM_MAX_WEIGHT = float(os.getenv("SIM_MAX_WEIGHT", "2500"))
+
+# Вероятность «поставить груз» за один тик в режиме простоя.
+# 0.25 → в среднем ~4 с нуля, потом взвешивание.
+SIM_LOAD_PROBABILITY = float(os.getenv("SIM_LOAD_PROBABILITY", "0.25"))
+
+# Вероятность «снять груз» за один тик в режиме взвешивания.
+# 0.01 → в среднем ~100 с ненулевого веса подряд.
+SIM_UNLOAD_PROBABILITY = float(os.getenv("SIM_UNLOAD_PROBABILITY", "0.01"))
 
 
 def log(message: str) -> None:
@@ -73,6 +113,9 @@ def simulate_weights() -> Iterator[float]:
 
     Сценарий имитирует работу кладовщика: груз выставляется, стабилизируется
     с небольшим шумом, затем снимается (вес возвращается к нулю).
+
+    По умолчанию большую часть времени вес ненулевой: груз «ставится» быстро
+    (SIM_LOAD_PROBABILITY) и «снимается» редко (SIM_UNLOAD_PROBABILITY).
     """
     state = "idle"
     current = 0.0
@@ -81,9 +124,9 @@ def simulate_weights() -> Iterator[float]:
 
     while True:
         if state == "idle":
-            if random.random() < 0.05:
+            if random.random() < SIM_LOAD_PROBABILITY:
                 target = random.uniform(SIM_MIN_WEIGHT, SIM_MAX_WEIGHT)
-                settle_left = random.randint(3, 8)
+                settle_left = random.randint(2, 5)
                 state = "settling"
                 log(f"груз выставлен: ~{target:.0f} г")
             current = 0.0
@@ -102,10 +145,9 @@ def simulate_weights() -> Iterator[float]:
         # Плавный переход к новому состоянию, чтобы значение не прыгало.
         yield current
 
-        if state == "weighing" and random.random() < 0.03:
+        if state == "weighing" and random.random() < SIM_UNLOAD_PROBABILITY:
             state = "idle"
             log("груз снят")
-
 
 def read_serial(port: str, baud: int) -> Iterator[float]:
     """Читает веса с реального Serial-порта Arduino.
@@ -173,7 +215,7 @@ def publish(weight_g: float, line: str, timeout: float = 5.0) -> bool:
     except HTTPError as error:
         log(f"API отклонил показание: {error.code} {error.reason}")
     except URLError as error:
-        log(f"API недоступен ({error.reason}) — повторю позже")
+        log(_get_helpful_error_message(API_BASE_URL))
     return False
 
 
@@ -197,6 +239,12 @@ def main() -> int:
     signal.signal(signal.SIGINT, _handle_signal)
 
     log(f"API: {API_BASE_URL}")
+    if API_BASE_URL == "http://api:8000":
+        if not _is_running_in_docker():
+            log("Внимание: эмулятор ожидает API по адресу 'http://api:8000', который является Docker-internal hostname.")
+            log("Если вы запускаете эмулятор на хосте, установите переменную окружения API_BASE_URL,")
+            log("например, API_BASE_URL=http://127.0.0.1:8000")
+            log("Если вы хотите использовать Docker, запустите эмулятор через 'docker compose --profile scale up -d scale-emulator'")
 
     source = None
     if SERIAL_PORT:
