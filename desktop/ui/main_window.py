@@ -289,27 +289,27 @@ class MainWindow:
                                          text_color=pal.muted_text)
         self._theme_label.pack(side='left', padx=(0, 6))
 
+        # Сегменты сразу с русскими подписями — без обращения к приватным
+        # атрибутам CTkSegmentedButton (совместимо с customtkinter >= 6.0).
+        self._THEME_CAPTIONS = {'light': 'Светлая', 'dark': 'Тёмная'}
+        self._THEME_VALUES = {caption: mode
+                              for mode, caption in self._THEME_CAPTIONS.items()}
         self.theme_switch = ctk.CTkSegmentedButton(
             right,
-            values=['light', 'dark'],
+            values=[self._THEME_CAPTIONS['light'], self._THEME_CAPTIONS['dark']],
             height=30,
             corner_radius=8,
             border_width=0,
             font=ctk.CTkFont(size=13),
             command=self._on_theme_selected,
         )
-        self.theme_switch.set(theme.current_mode())
+        self.theme_switch.set(self._THEME_CAPTIONS[theme.current_mode()])
         self.theme_switch.pack(side='left', padx=(0, 10))
-        # Подписи сегментов по-русски: переопределяем текст кнопок-сегментов.
-        for value, caption in (('light', 'Светлая'), ('dark', 'Тёмная')):
-            button = self.theme_switch._segmented_button.get(value)
-            if button is not None:
-                button.configure(text=caption)
 
         self._about_button = ctk.CTkButton(
             right, text='О программе', width=110, height=30,
             corner_radius=8, border_width=0,
-            fg_color='transparent', border_color='transparent',
+            fg_color='transparent',
             hover_color=pal.hover, text_color=pal.text,
             command=self._show_about,
         )
@@ -320,7 +320,8 @@ class MainWindow:
                                        corner_radius=0, border_width=0)
         self._topbar_sep.pack(fill='x', side='top')
 
-    def _on_theme_selected(self, mode: str):
+    def _on_theme_selected(self, caption: str):
+        mode = self._THEME_VALUES.get(caption, theme.current_mode())
         theme.apply_theme(mode)
         # Статичные панели (верхняя/нижняя) перекрашиваем под новую тему
         self._retopaint_chrome()
