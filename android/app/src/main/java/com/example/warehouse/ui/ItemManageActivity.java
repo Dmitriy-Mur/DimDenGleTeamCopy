@@ -229,7 +229,18 @@ public class ItemManageActivity extends AppCompatActivity {
                         .setTitle("Переместить в контейнер")
                         .setItems(labels, (dialog, which) -> {
                             Integer targetBoxId = which == 0 ? null : flat.get(which - 1).id;
-                            patch(ItemUpdateBody.moveTo(targetBoxId), false);
+                            // Текущие значения подставляем в неизменяемые поля:
+                            // Gson с serializeNulls отправил бы quantity=null,
+                            // и сервер прочёл бы это как «обнулить количество».
+                            // При «вынуть из контейнера» (box_id=null) оставляем
+                            // ненулевой item_type_id — иначе сервер решит, что
+                            // обновлять нечего.
+                            ItemUpdateBody body = ItemUpdateBody.moveTo(targetBoxId);
+                            body.quantity = item.quantity;
+                            if (body.item_type_id == null) {
+                                body.item_type_id = item.item_type_id;
+                            }
+                            patch(body, false);
                         })
                         .setNegativeButton("Отмена", null)
                         .show();

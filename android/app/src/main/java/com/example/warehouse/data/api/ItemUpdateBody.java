@@ -21,35 +21,44 @@ public class ItemUpdateBody {
     public Integer box_id;
     public Integer item_type_id;
 
-    /** Текущие значения позиции; не сериализуются (private — Gson их игнорирует). */
-    private Integer currentBoxId;
-    private Integer currentTypeId;
-
-    /** Запоминает текущие box/type позиции, чтобы фабрики подставляли их в тело. */
-    public ItemUpdateBody withCurrent(Integer boxId, Integer typeId) {
-        this.currentBoxId = boxId;
-        this.currentTypeId = typeId;
-        return this;
+    /** Изменение количества позиции. */
+    public static ItemUpdateBody quantity(int value) {
+        ItemUpdateBody body = new ItemUpdateBody();
+        body.quantity = value;
+        return body;
     }
 
-    public static ItemUpdateBody moveTo(Integer boxId, Integer currentBoxId, Integer currentTypeId) {
+    /** Перемещение позиции в другой контейнер (boxId == null — вынуть). */
+    public static ItemUpdateBody moveTo(Integer boxId) {
         ItemUpdateBody body = new ItemUpdateBody();
         body.box_id = boxId;
-        // Тип передаём текущим: при «вынуть из контейнера» (box_id == null)
-        // в теле должно остаться хотя бы одно ненулевое поле, иначе сервер
-        // решит, что обновлять нечего.
-        body.item_type_id = currentTypeId;
         return body;
     }
 
     /** Смена типа товара позиции. */
-    public static ItemUpdateBody itemType(int itemTypeId, Integer currentBoxId) {
+    public static ItemUpdateBody itemType(int itemTypeId) {
         ItemUpdateBody body = new ItemUpdateBody();
         body.item_type_id = itemTypeId;
-        // Контейнер передаём текущим — иначе null в box_id сервер прочтёт
-        // как намерение «вынуть позицию из контейнера», и товар исчезнет
-        // из открытого контейнера.
-        body.box_id = currentBoxId;
         return body;
+    }
+
+    /**
+     * Подставляет ТЕКУЩИЕ значения неизменяемых полей в тело запроса.
+     * Нужно из-за Gson serializeNulls: все три поля всегда попадают в JSON,
+     * и null в них сервер прочёл бы как намерения «вынуть из контейнера» /
+     * «сменить тип на null» (товар исчезал из списка; изменение количества
+     * падало с «Item type not found»). Аргументы — item.box_id и
+     * item.item_type_id позиции. Поле «Вынуть из контейнера» (moveTo(null))
+     * остаётся null намеренно; quantity заполняется текущим количеством
+     * вызывающим кодом.
+     */
+    public ItemUpdateBody withCurrent(Integer boxId, Integer typeId) {
+        if (this.box_id == null) {
+            this.box_id = boxId;
+        }
+        if (this.item_type_id == null) {
+            this.item_type_id = typeId;
+        }
+        return this;
     }
 }
