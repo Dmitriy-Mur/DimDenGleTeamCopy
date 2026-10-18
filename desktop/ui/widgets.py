@@ -207,96 +207,189 @@ class DarkTableFrame(ctk.CTkFrame):
         self._row_count = 0
 
 
-class DarkScrollableFrame(ctk.CTkScrollableFrame):
-    """CTkScrollableFrame с ползунком прокрутки, скрытым когда он не нужен.
+def _to_hex(color) -> str:
+    """Привести цвет Tk к hex-строке (поддержка 'gray55' и вида для двух тем)."""
+    if isinstance(color, (tuple, list)):
+        color = color[0]
+    s = str(color).strip()
+    if s.lower() == 'transparent':
+        return '#000000'
+    if s.startswith('#'):
+        if len(s) == 4:  # сокращённая форма #abc
+            return '#' + ''.join(ch * 2 for ch in s[1:])
+        return s
+    try:
+        import tkinter as _tk
+        root = _tk._default_root
+        if root is not None:
+            rgb = root.winfo_rgb(s)  # значения 0..65535
+            return '#{r:02x}{g:02x}{b:02x}'.format(r=rgb[0] // 256,
+                                                   g=rgb[1] // 256,
+                                                   b=rgb[2] // 256)
+    except Exception:
+        pass
+    return '#808080'
 
-    Встроенный CTkScrollbar всегда занимает место справа; здесь он заменяется
-    на собственный canvas-скроллбар, который рисуется только при реальной
-    необходимости (содержимое выше области просмотра). Цвета обновляются
-    при смене темы.
+
+def _mix_colors(c1: str, c2: str, t: float) -> str:
+    """Линейная смесь двух цветов: t=0 → c1, t=1 → c2."""
+    def comp(h):
+        h = _to_hex(h).lstrip('#')
+        return tuple(int(h[i:i + 2], 16) for i in (0, 2, 4))
+    a, b = comp(c1), comp(c2)
+    r = tuple(round(x + (y - x) * t) for x, y in zip(a, b))
+    return f'#{r[0]:02x}{r[1]:02x}{r[2]:02x}'
+
+
+class DarkScrollableFrame(ctk.CTkScrollableFrame):
+    """CTkScrollableFrame с тонкой полосой прокрутки справа от содержимого.
+
+    Исправляет два дефекта предыдущих реализаций:
+
+    1. *Наложение на элементы дерева.* Собственный canvas-ползунок
+       размещался через ``place`` поверх холста с содержимым и перекрывал
+       строки дерева. Теперь полоса — это нативный ``CTkScrollbar``,
+       размеченный в отдельной grid-колонке справа от ``_parent_canvas``:
+       физически пересечься с узлами он не может.
+    2. *Слияние с фоном.* Нативная полоса customtkinter по умолчанию
+       красится в цвета темы библиотеки, близкие к фону панели. Здесь
+       ползунок перекрашивается в контрастный оттенок палитры приложения
+       (``pal.scrollbar``), «корыто» — в чуть затемнённый фон панели,
+       так что полоса различима и в светлой, и в тёмной теме; при
+       наведении ползунок подсвечивается.
+
+    Когда содержимое помещается целиком, полоса становится полностью
+    прозрачной (визуально исчезает, ширина контента при этом не «прыгает»,
+    т.к. weight у колонки полосы нулевой).
     """
 
-    BAR_WIDTH = 12
-    BAR_TROUGH = 'transparent'
-
-    def _hide_native_scrollbar(self):
-        """Убрать встроенный CTkScrollbar из разметки.
-
-        customtkinter размещает его в сетке навсегда — полоса видна даже
-        когда содержимое помещается целиком, а поверх неё фон родительской
-        рамки делает её неоткликаемой. Виджет остаётся жив (на него
-        ссылается внутренний API библиотеки), но исчезает из разметки.
-        Вызывается и после смены corner_radius/border_width/label_text,
-        потому что ``_create_grid`` возвращает полосу в сетку.
-        """
-        scrollbar = getattr(self, '_scrollbar', None)
-        if scrollbar is not None:
-            try:
-                scrollbar.grid_forget()
-            except Exception:
-                pass
-
-    def _create_grid(self):
-        super()._create_grid()
-        self._hide_native_scrollbar()
+    #: Ширина колонки прокрутки (в масштабируемых единицах UI).
+    BAR_WIDTH = 10
 
     def __init__(self, master, **kwargs):
         kwargs.setdefault('fg_color', 'transparent')
         kwargs.setdefault('label_text', '')
         super().__init__(master, **kwargs)
 
-        # Полосы во всей сетке больше нет: ни следа от встроенного скроллбара.
-        self._hide_native_scrollbar()
-
-        # Родительский CTkFrame перерисовывает свой canvas при любом
-        # изменении размера — после этого перерисуем и наш скроллбар,
-        # чтобы он не оказался под фоном рамки.
-        parent_canvas = self._parent_frame._canvas
-        parent_canvas.bind('<Configure>', lambda e: self._schedule_redraw(), add=True)
-
-        self._auto_bar = tk.Canvas(
-            self._parent_frame,
-            width=self._apply_widget_scaling(self.BAR_WIDTH),
-            height=1,
-            highlightthickness=0,
-            bd=0,
-            bg=self._canvas_bg(),
-        )
-        # Ползунок прижат к правому краю панели; координаты задаются через
-        # relx+anchor, а не отрицательным x — иначе полоса уходила за левый
-        # край и не отвечала на клики.
-        self._auto_bar.place(relx=1.0, x=-self._apply_widget_scaling(4), rely=0.5,
-                             anchor='e', relheight=0.94)
-        self._auto_bar.bind('<Button-1>', self._bar_clicked)
-        self._auto_bar.bind('<B1-Motion>', self._bar_drag)
-
-        self._parent_canvas.configure(yscrollcommand=self._auto_set)
-        self._parent_canvas.bind('<Configure>', lambda e: self._schedule_redraw(), add=True)
+        # Наследие прежней реализации: canvas-оверлей поверх содержимого.
+        # Убираем, если он вдруг существует (пересборка виджета на лету).
+        old_bar = getattr(self, '_auto_bar', None)
+        if old_bar is not None:
+            try:
+                old_bar.destroy()
+            except tk.TclError:
+                pass
+        self._auto_bar = None
 
         self._thumb_start = 0.0
         self._thumb_end = 1.0
-        self._drag_offset = 0.0
         self._redraw_job = None
+
+        # Колонка полосы: фиксированная ширина, нулевой weight — содержимое
+        # всегда в column 0 и полоса его не перекрывает.
+        self._apply_scrollbar_column()
+
+        # Перекраска при любых изменениях геометрии и при смене темы.
+        for cv in (self._parent_frame._canvas, self._parent_canvas):
+            cv.bind('<Configure>', lambda e: self._schedule_redraw(), add=True)
+        self.bind('<Configure>', lambda e: self._schedule_redraw(), add=True)
+
+        # Прокрутка колесом/сменой содержимого тоже должна обновлять
+        # состояние «видима/прозрачна» и положение ползунка.
+        self._parent_canvas.configure(yscrollcommand=self._auto_set)
 
         toplevel = self.winfo_toplevel()
         toplevel.bind('<<ThemeChanged>>', lambda _e=None: self._schedule_redraw(), add='+')
 
+        self._schedule_redraw()
+
+    # ------------------------------------------------------------------ layout
+    def _apply_scrollbar_column(self):
+        """Задать параметры grid для колонки прокрутки."""
+        try:
+            pf = self._parent_frame
+            pf.grid_columnconfigure(0, weight=1, minsize=0)
+            pf.grid_columnconfigure(1, weight=0,
+                                    minsize=self._apply_widget_scaling(self.BAR_WIDTH))
+        except Exception:
+            pass
+
+    def _create_grid(self):
+        super()._create_grid()
+        # После перестроения сетки (corner_radius / border_width / label_text)
+        # заново настроить колонку полосы.
+        if hasattr(self, '_parent_frame'):
+            self._apply_scrollbar_column()
+
+    # ------------------------------------------------------------------- цвета
     def _bar_color(self) -> str:
+        """Контрастный цвет ползунка для текущей темы."""
         return theme.palette().scrollbar
 
-    def _canvas_bg(self) -> str:
+    def _panel_base_color(self) -> str:
         fg = self._parent_frame.cget('fg_color')
         color = self._parent_frame.cget('bg_color') if fg == 'transparent' else fg
-        return self._apply_appearance_mode(color)
+        base = self._apply_appearance_mode(color)
+        if isinstance(base, (tuple, list)):
+            base = base[0]
+        return str(base)
+
+    def _trough_color(self) -> str:
+        """«Корыто» — чуть темнее фона панели, чтобы полоса читалась."""
+        base = self._panel_base_color()
+        factor = 0.18 if theme.current_mode() == 'dark' else 0.08
+        return _mix_colors(base, '#000000', factor)
+
+    def _hover_color(self) -> str:
+        """Подсветка ползунка при наведении — ярче основного оттенка."""
+        pal = theme.palette()
+        base = pal.scrollbar
+        target = '#ffffff' if theme.current_mode() == 'dark' else '#000000'
+        return _mix_colors(base, target, 0.25)
+
+    def _recolor_scrollbar(self):
+        """Перекрасить нативный CTkScrollbar под тему и нужность прокрутки.
+
+        Без необходимости прокрутки все элементы полосы прозрачны — она
+        визуально исчезает, но продолжает занимать свою колонку (ширина
+        контента не меняется). При необходимости — контрастный ползунок
+        над нейтральным корытом; цвета берутся из палитры приложения, а
+        не из темы customtkinter, поэтому полоса не сливается с фоном ни
+        в светлой, ни в тёмной теме.
+        """
+        sb = getattr(self, '_scrollbar', None)
+        if sb is None or not sb.winfo_exists():
+            return
+        needs = self._needs_scroll
+        trough = self._trough_color() if needs else 'transparent'
+        thumb = self._bar_color() if needs else 'transparent'
+        hover = self._hover_color() if needs else 'transparent'
+        try:
+            sb.configure(fg_color=trough, button_color=thumb, button_hover_color=hover)
+        except Exception:
+            pass
+        # configure мог быть перехвачен внутренними обработчиками библиотеки —
+        # проверяем результат и правим приватные атрибуты напрямую, после чего
+        # заставляем полосу перерисоваться.
+        cur_btn = str(sb.cget('button_color'))
+        if cur_btn != thumb:
+            try:
+                sb._fg_color = trough
+                sb._button_color = thumb
+                sb._button_hover_color = hover
+                sb._draw()
+            except Exception:
+                pass
 
     # -- синхронизация с канвасом -------------------------------------------
     def _auto_set(self, lo, hi):
+        """yscrollcommand: запоминаем доли и перекрашиваем полосу."""
         self._thumb_start = float(lo)
         self._thumb_end = float(hi)
         self._schedule_redraw()
 
     def _schedule_redraw(self):
-        """Перерисовать ползунок после завершения текущих событий Tk."""
+        """Обновить полосу после завершения текущих событий Tk."""
         if self._redraw_job is not None:
             try:
                 self.winfo_toplevel().after_cancel(self._redraw_job)
@@ -308,7 +401,7 @@ class DarkScrollableFrame(ctk.CTkScrollableFrame):
             self._redraw_bar()
 
     def _after_content_change(self):
-        """Обновить scrollregion и видимость скроллбара после изменения содержимого."""
+        """Обновить scrollregion и состояние полосы после изменения содержимого."""
         self._parent_canvas.update_idletasks()
         bbox = self._parent_canvas.bbox('all')
         if bbox:
@@ -325,42 +418,4 @@ class DarkScrollableFrame(ctk.CTkScrollableFrame):
 
     def _redraw_bar(self):
         self._redraw_job = None
-        if not self._auto_bar.winfo_exists():
-            return
-        self._auto_bar.configure(bg=self._canvas_bg())
-        self._auto_bar.delete('all')
-        if not self._needs_scroll:
-            return
-        h = self._auto_bar.winfo_height()
-        w = self._auto_bar.winfo_width()
-        if h <= 1 or w <= 1:
-            return
-        top = max(0, int(self._thumb_start * h))
-        bottom = min(h, int(self._thumb_end * h))
-        if bottom - top < 20:
-            bottom = min(h, top + 20)
-        pad = 2
-        try:
-            self._auto_bar.create_rectangle(pad, top, w - pad, bottom, radius=4,
-                                            fill=self._bar_color(), outline='')
-        except tk.TclError:
-            # Tk < 8.7 не поддерживает сглаженные углы у прямоугольников
-            self._auto_bar.create_rectangle(pad, top, w - pad, bottom,
-                                            fill=self._bar_color(), outline='')
-
-    # -- взаимодействие -------------------------------------------------------
-    def _value_from_y(self, y):
-        h = max(1, self._auto_bar.winfo_height())
-        length = self._thumb_end - self._thumb_start
-        center = min(max(y / h, length / 2), 1 - length / 2)
-        start = center - length / 2
-        self._parent_canvas.yview_moveto(start)
-
-    def _bar_clicked(self, event):
-        h = max(1, self._auto_bar.winfo_height())
-        self._drag_offset = ((self._thumb_start + self._thumb_end) / 2) - event.y / h
-        self._value_from_y(event.y)
-
-    def _bar_drag(self, event):
-        h = max(1, self._auto_bar.winfo_height())
-        self._value_from_y(event.y + self._drag_offset * h)
+        self._recolor_scrollbar()
