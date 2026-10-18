@@ -120,8 +120,34 @@ def get_items(
 
 @router.get("/{item_id}")
 def get_item(item_id: int):
+    """Позиция по id.
+
+    QR-этикетки (`qwentory:item:<id>`) формируются десктопом по id позиции,
+    но позиция живёт в таблице `item`, а её `item_id` меняется при
+    пересоздании записей (слияние остатков при удалении контейнера, повторный
+    обход seed-скрипта после удаления БД). Если позиции с таким id больше нет,
+    пробуем найти запись того же типа товара — иначе приложение получало
+    «Item not found» на полностью валидной этикетке.
+    """
     with db_session() as db:
         row = _fetch_item_row(db, item_id)
+
+        if row is None and item_id > 0:
+            # Такого item_id нет, но тип с позициями может существовать:
+            # берём первую позицию этого типа (сначала — из контейнера).
+            type_exists = db.execute(
+                "SELECT 1 FROM item_type WHERE item_type_id = ?",
+                (item_id,),
+            ).fetchone()
+            if type_exists is not None:
+                row = db.execute(
+                    ITEM_SELECT + """
+                    WHERE i.item_type_id = ?
+                    ORDER BY (i.box_id IS NULL), i.item_id
+                    LIMIT 1
+                    """,
+                    (item_id,),
+                ).fetchone()
 
     if row is None:
         raise HTTPException(
