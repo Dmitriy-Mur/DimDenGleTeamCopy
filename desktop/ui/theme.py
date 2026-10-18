@@ -64,8 +64,13 @@ DEFAULT_MODE = 'dark'
 
 
 def current_mode() -> str:
-    """Сохранённый режим темы: 'light' или 'dark'."""
-    saved = ctk.get_appearance_mode()
+    """Сохранённый режим темы: 'light' или 'dark'.
+
+    ``get_appearance_mode()`` возвращает строку с заглавной буквы
+    ('Light'/'Dark') и 'System', если режим не задавался явно, —
+    нормализуем к ключам палитры.
+    """
+    saved = ctk.get_appearance_mode().lower()
     return saved if saved in PALETTES else DEFAULT_MODE
 
 
@@ -89,12 +94,15 @@ def apply_theme(mode: str) -> None:
     root = tk._default_root  # noqa: SLF001 — единственный способ достать корень Tk
     if root is not None:
         bg = palette(mode).window_bg
-        root.configure(bg=bg)
         for widget in _walk(root):
+            # CTk-виджеты (CTk/CTkToplevel/CTkFrame) не принимают Tk-опцию
+            # ``bg`` — они перекрашиваются сами через set_appearance_mode.
+            if isinstance(widget, ctk.CTkBaseClass):
+                continue
             try:
                 if widget.winfo_class() in ('Toplevel', 'Frame'):
                     widget.configure(bg=bg)
-            except tk.TclError:
+            except (tk.TclError, ValueError):
                 pass
         try:
             root.event_generate('<<ThemeChanged>>')
