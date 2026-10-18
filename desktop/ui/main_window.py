@@ -252,17 +252,22 @@ class TreeWidget(DarkScrollableFrame):
     def _apply_visibility(self):
         """Переупаковать ряды в порядке обхода, скрывая ветки свёрнутых узлов.
 
-        Ряды переупаковываются ВСЕГДА (даже при пустом дереве), иначе
-        pack_forget-скрытые строки могли бы остаться в старом порядке.
+        Сначала ``pack_forget`` применяется ко всем рядам, затем видимые
+        переупаковываются строго по ``_order``. Иначе Tk добавляет только что
+        упакованный виджет в конец очереди pack — после разворачивания узла
+        его дочерние строки оказывались внизу списка вместо позиции сразу под
+        родителем.
         """
         self._order = [bid for bid in self._order if bid in self.nodes]
+        # 1. Скрыть все ряды, чтобы pack ниже шёл всегда в чистую очередь.
+        for box_id in self._order:
+            self.nodes[box_id]['row'].pack_forget()
+        # 2. Показать только видимые — в правильном порядке обхода.
         for box_id in self._order:
             node = self.nodes[box_id]
             if self._is_visible(box_id):
                 node['row'].pack(fill='x', pady=1,
                                  padx=(node['level'] * self.INDENT, 0))
-            else:
-                node['row'].pack_forget()
 
     def _sync_scrollregion(self):
         """Обновить область прокрутки после изменения набора видимых строк."""
