@@ -9,8 +9,8 @@ import androidx.appcompat.app.AppCompatActivity;
 
 import com.example.warehouse.data.api.ApiClient;
 import com.example.warehouse.data.api.ItemUpdateBody;
-import com.example.warehouse.data.model.BoxContents;
 import com.example.warehouse.data.model.BoxNode;
+import com.example.warehouse.data.model.ItemSummary;
 import com.example.warehouse.data.model.ItemTypeSummary;
 import com.example.warehouse.databinding.ActivityItemManageBinding;
 
@@ -45,7 +45,7 @@ public class ItemManageActivity extends AppCompatActivity {
     /** Контейнер, из которого открыли позицию (0 — позиция вне контейнера). */
     private int originBoxId;
     /** Актуальная запись позиции после последнего успешного PATCH. */
-    private BoxContents.ItemRow item;
+    private ItemSummary item;
 
     @Override
     protected void onCreate(Bundle savedInstanceState) {
@@ -71,10 +71,10 @@ public class ItemManageActivity extends AppCompatActivity {
     /** Подтягивает актуальную запись позиции — сервер источник истины. */
     private void loadItem() {
         setLoading(true);
-        ApiClient.api().getItem(itemId).enqueue(new Callback<BoxContents.ItemRow>() {
+        ApiClient.api().getItem(itemId).enqueue(new Callback<ItemSummary>() {
             @Override
-            public void onResponse(Call<BoxContents.ItemRow> call,
-                                   Response<BoxContents.ItemRow> response) {
+            public void onResponse(Call<ItemSummary> call,
+                                   Response<ItemSummary> response) {
                 setLoading(false);
                 if (response.isSuccessful() && response.body() != null) {
                     item = response.body();
@@ -85,7 +85,7 @@ public class ItemManageActivity extends AppCompatActivity {
             }
 
             @Override
-            public void onFailure(Call<BoxContents.ItemRow> call, Throwable t) {
+            public void onFailure(Call<ItemSummary> call, Throwable t) {
                 setLoading(false);
                 toast("Сеть недоступна: " + t.getMessage());
             }
@@ -96,7 +96,7 @@ public class ItemManageActivity extends AppCompatActivity {
         binding.tvTitle.setText(item.item_type_name);
 
         StringBuilder info = new StringBuilder();
-        info.append("Позиция #").append(item.item_id);
+        info.append("Позиция #").append(item.id);
         if (item.weight_g != null) {
             info.append(" · вес единицы: ").append(formatWeight(item.weight_g));
         }
@@ -252,7 +252,7 @@ public class ItemManageActivity extends AppCompatActivity {
         new AlertDialog.Builder(this)
                 .setTitle("Удалить товар?")
                 .setMessage(item.item_type_name + " (" + item.quantity + " шт., позиция #"
-                        + item.item_id + ") будет удалена без возможности восстановления.")
+                        + item.id + ") будет удалена без возможности восстановления.")
                 .setPositiveButton("Удалить", (dialog, which) -> deleteItem())
                 .setNegativeButton("Отмена", null)
                 .show();
@@ -291,10 +291,10 @@ public class ItemManageActivity extends AppCompatActivity {
      */
     private void patch(ItemUpdateBody body, boolean changed) {
         setLoading(true);
-        ApiClient.api().updateItem(itemId, body).enqueue(new Callback<BoxContents.ItemRow>() {
+        ApiClient.api().updateItem(itemId, body).enqueue(new Callback<ItemSummary>() {
             @Override
-            public void onResponse(Call<BoxContents.ItemRow> call,
-                                   Response<BoxContents.ItemRow> response) {
+            public void onResponse(Call<ItemSummary> call,
+                                   Response<ItemSummary> response) {
                 setLoading(false);
                 if (response.isSuccessful() && response.body() != null) {
                     item = response.body();
@@ -309,7 +309,7 @@ public class ItemManageActivity extends AppCompatActivity {
             }
 
             @Override
-            public void onFailure(Call<BoxContents.ItemRow> call, Throwable t) {
+            public void onFailure(Call<ItemSummary> call, Throwable t) {
                 setLoading(false);
                 toast("Сеть недоступна: " + t.getMessage());
             }
